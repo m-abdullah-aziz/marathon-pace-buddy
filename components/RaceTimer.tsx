@@ -16,13 +16,13 @@ const RaceTimer: React.FC<Props> = ({ plan, theme, phase, onPhaseChange, onFinis
   const [elapsed, setElapsed] = useState(0);
   const [distanceKm, setDistanceKm] = useState(0);
   const [currentPace, setCurrentPace] = useState(0); 
-  const [gpsActive, setGpsActive] = useState(false);
+  const [gpsStatus, setGpsStatus] = useState<'idle' | 'searching' | 'active' | 'error'>('idle');
+  const [accuracy, setAccuracy] = useState<number | null>(null);
   const [weather, setWeather] = useState<WeatherInfo | undefined>();
-  const [fetchingWeather, setFetchingWeather] = useState(false);
   
   const timerRef = useRef<number | null>(null);
   const watchIdRef = useRef<number | null>(null);
-  const pathRef = useRef<{ lat: number; lng: number; timestamp: number }[]>([]);
+  const pathRef = useRef<{ lat: number; lng: number; timestamp: number; dist: number }[]>([]);
   const samplesRef = useRef<PaceSample[]>([]);
   const lastSampleDistRef = useRef(0);
   const weatherFetchedRef = useRef(false);
@@ -40,50 +40,96 @@ const RaceTimer: React.FC<Props> = ({ plan, theme, phase, onPhaseChange, onFinis
     return R * c;
   };
 
+  // Calculate pace based on a rolling window of the last 30 seconds of movement
+  const updateRollingPace = () => {
+    if (pathRef.current.length < 2) return;
+    
+    const now = Date.now();
+    const windowMs = 30000; // 30 second window for smoothing
+    const windowStart = now - windowMs;
+    
+    const pointsInWindow = pathRef.current.filter(p => p.timestamp >= windowStart);
+    
+    if (pointsInWindow.length < 2) {
+      // If we haven't moved enough in the window, but we are running, 
+      // check if we've actually stopped
+      const lastPoint = pathRef.current[pathRef.current.length - 1];
+      if (now - lastPoint.timestamp > 10000) setCurrentPace(0);
+      return;
+    }
+
+    const first = pointsInWindow[0];
+    const last = pointsInWindow[pointsInWindow.length - 1];
+    
+    const distDiff = last.dist - first.dist;
+    const timeDiffSec = (last.timestamp - first.timestamp) / 1000;
+    
+    if (distDiff > 0.002) { // Only update if there's measurable movement
+      const pace = timeDiffSec / distDiff;
+      setCurrentPace(pace);
+    } else if (timeDiffSec > 15) {
+      setCurrentPace(0); // Effectively stopped
+    }
+  };
+
   useEffect(() => {
     if (phase === 'running') {
       const startTime = Date.now() - elapsed;
+      
       timerRef.current = window.setInterval(() => {
-        setElapsed(Date.now() - startTime);
-      }, 100);
+        const now = Date.now();
+        setElapsed(now - startTime);
+        updateRollingPace();
+      }, 1000);
 
       if ('geolocation' in navigator) {
-        setGpsActive(true);
+        setGpsStatus('searching');
         watchIdRef.current = navigator.geolocation.watchPosition(
           (pos) => {
-            const { latitude: lat, longitude: lng } = pos.coords;
+            const { latitude: lat, longitude: lng, accuracy: acc } = pos.coords;
+            setAccuracy(acc);
+            
+            // Allow slightly worse accuracy initially to get a lock
+            if (acc > 50 && pathRef.current.length > 5) return;
+            
+            setGpsStatus('active');
             const now = Date.now();
             const lastPoint = pathRef.current[pathRef.current.length - 1];
 
-            // Fetch weather once on first location
-            if (!weatherFetchedRef.current && !fetchingWeather) {
-              setFetchingWeather(true);
+            if (!weatherFetchedRef.current) {
               getWeatherByLocation(lat, lng).then(data => {
                 setWeather(data);
                 weatherFetchedRef.current = true;
-                setFetchingWeather(false);
               });
             }
 
+            let newTotalDist = distanceKm;
             if (lastPoint) {
               const d = calculateDistance(lastPoint.lat, lastPoint.lng, lat, lng);
-              if (d > 0.002) { 
-                const newDist = distanceKm + d;
-                setDistanceKm(newDist);
-                const timeDiffSec = (now - lastPoint.timestamp) / 1000;
-                const pace = timeDiffSec / d;
-                setCurrentPace(pace);
-
-                if (newDist - lastSampleDistRef.current > 0.25) {
-                  samplesRef.current.push({ distance: newDist, pace, timestamp: now });
-                  lastSampleDistRef.current = newDist;
+              // Filter out jitter (less than 2 meters)
+              if (d > 0.002) {
+                newTotalDist += d;
+                setDistanceKm(newTotalDist);
+                
+                if (newTotalDist - lastSampleDistRef.current > 0.1) {
+                  samplesRef.current.push({ 
+                    distance: newTotalDist, 
+                    pace: currentPace, 
+                    elapsedMs: now - startTime,
+                    timestamp: now 
+                  });
+                  lastSampleDistRef.current = newTotalDist;
                 }
               }
             }
-            pathRef.current.push({ lat, lng, timestamp: now });
+            
+            pathRef.current.push({ lat, lng, timestamp: now, dist: newTotalDist });
           },
-          (err) => console.error("GPS Error", err),
-          { enableHighAccuracy: true, maximumAge: 1000, timeout: 5000 }
+          (err) => {
+            console.error("GPS Error", err);
+            setGpsStatus('error');
+          },
+          { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
         );
       }
     } else {
@@ -96,19 +142,16 @@ const RaceTimer: React.FC<Props> = ({ plan, theme, phase, onPhaseChange, onFinis
     };
   }, [phase]);
 
-  const handleStart = () => onPhaseChange('running');
-  
   const handleStop = () => {
-    const session: RaceSession = {
+    onFinish({
       startTime: Date.now() - elapsed,
       endTime: Date.now(),
-      totalDistanceKm: distanceKm > 0 ? distanceKm : (elapsed / 1000) / plan.averagePaceSecondsPerKm,
-      coordinates: pathRef.current,
+      totalDistanceKm: distanceKm,
+      coordinates: pathRef.current.map(({lat, lng, timestamp}) => ({lat, lng, timestamp})),
       currentPaceSecondsPerKm: currentPace,
       paceSamples: samplesRef.current,
       weather
-    };
-    onFinish(session);
+    });
   };
 
   const handleReset = () => {
@@ -118,45 +161,45 @@ const RaceTimer: React.FC<Props> = ({ plan, theme, phase, onPhaseChange, onFinis
     pathRef.current = [];
     samplesRef.current = [];
     lastSampleDistRef.current = 0;
-    setWeather(undefined);
     weatherFetchedRef.current = false;
+    setGpsStatus('idle');
+    setAccuracy(null);
     onPhaseChange('idle');
   };
 
   const formatTime = (ms: number) => {
     const totalSeconds = Math.floor(ms / 1000);
-    const hours = Math.floor(totalSeconds / 3600);
-    const minutes = Math.floor((totalSeconds % 3600) / 60);
-    const seconds = totalSeconds % 60;
-    const deciseconds = Math.floor((ms % 1000) / 100);
-    return `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.${deciseconds}`;
+    const h = Math.floor(totalSeconds / 3600);
+    const m = Math.floor((totalSeconds % 3600) / 60);
+    const s = totalSeconds % 60;
+    return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
 
   const formatPace = (secs: number) => {
-    if (!secs || !isFinite(secs)) return '--:--';
+    if (!secs || !isFinite(secs) || secs <= 0) return '0:00';
+    if (secs > 3600) return '--:--';
     const m = Math.floor(secs / 60);
     const s = Math.floor(secs % 60);
     return `${m}:${s.toString().padStart(2, '0')}`;
   };
 
-  const displayDistance = distanceKm > 0 ? distanceKm : (elapsed / 1000) / plan.averagePaceSecondsPerKm;
-  const nextHydrationKm = Math.ceil((displayDistance + 0.001) / plan.hydrationIntervalKm) * plan.hydrationIntervalKm;
-  const nextGelKm = Math.ceil((displayDistance + 0.001) / plan.gelIntervalKm) * plan.gelIntervalKm;
+  const nextHydrationKm = Math.ceil((distanceKm + 0.001) / plan.hydrationIntervalKm) * plan.hydrationIntervalKm;
+  const nextGelKm = Math.ceil((distanceKm + 0.001) / plan.gelIntervalKm) * plan.gelIntervalKm;
 
   return (
-    <div className="space-y-4 md:space-y-6">
+    <div className="space-y-6">
       <div className="text-center">
-        <div className={`text-4xl md:text-5xl lg:text-6xl font-black font-heading tabular-nums tracking-tight mb-4 ${theme === 'dark' ? 'text-white' : activeTheme.text}`}>
+        <div className={`text-5xl md:text-6xl font-black font-heading tabular-nums tracking-tight mb-6 ${theme === 'dark' ? 'text-white' : activeTheme.text}`}>
           {formatTime(elapsed)}
         </div>
         
-        <div className="flex gap-2 justify-center">
+        <div className="flex gap-3 justify-center">
           {phase !== 'running' ? (
             <button
-              onClick={handleStart}
+              onClick={() => onPhaseChange('running')}
               className={`flex-1 py-4 rounded-2xl font-bold text-white transition-all shadow-lg active:scale-95 text-lg ${activeTheme.accent} shadow-current/20`}
             >
-              Start Race
+              Start Tracking
             </button>
           ) : (
             <button
@@ -168,64 +211,53 @@ const RaceTimer: React.FC<Props> = ({ plan, theme, phase, onPhaseChange, onFinis
           )}
           
           {elapsed > 0 && phase !== 'running' && (
-            <button
-              onClick={handleReset}
-              className={`px-6 py-4 rounded-2xl font-bold bg-black/5 hover:bg-black/10 transition-all active:scale-95 ${activeTheme.text}`}
-            >
+            <button onClick={handleReset} className={`px-6 py-4 rounded-2xl font-bold bg-black/5 hover:bg-black/10 transition-all ${activeTheme.text}`}>
               Reset
             </button>
           )}
         </div>
       </div>
 
-      {weather && (
-        <div className={`p-4 rounded-2xl border ${activeTheme.border} bg-yellow-500/5 animate-in fade-in duration-700`}>
-          <div className="flex items-center gap-3">
-            <div className="text-2xl">☀️</div>
-            <div>
-              <p className="text-xs font-black uppercase opacity-60">Race Day Weather</p>
-              <p className="text-sm font-bold">{weather.temp} - {weather.description}</p>
-            </div>
+      <div className="grid grid-cols-2 gap-4">
+        <div className={`p-5 rounded-2xl border ${activeTheme.border} bg-black/5 flex flex-col items-center relative`}>
+          <span className="text-[10px] uppercase font-black opacity-40 mb-1 tracking-widest">Distance</span>
+          <span className="text-2xl md:text-3xl font-black">{distanceKm.toFixed(2)} <span className="text-sm opacity-40">KM</span></span>
+          <div className="flex items-center gap-1.5 mt-2">
+             <div className={`w-2 h-2 rounded-full ${gpsStatus === 'active' ? 'bg-green-500' : 'bg-yellow-500 animate-pulse'}`}></div>
+             <span className="text-[10px] font-bold opacity-60 uppercase">{gpsStatus} {accuracy && `(${accuracy.toFixed(0)}m)`}</span>
           </div>
         </div>
-      )}
-
-      <div className="grid grid-cols-2 gap-3 pt-2">
-        <div className={`p-4 rounded-xl border ${activeTheme.border} bg-black/5 flex flex-col items-center`}>
-          <span className="text-[10px] uppercase font-bold opacity-60 mb-1">Live Distance</span>
-          <span className="text-xl md:text-2xl font-black">{displayDistance.toFixed(2)} km</span>
-          <span className="text-[10px] opacity-40 font-bold">{gpsActive ? 'GPS ACTIVE' : 'PREDICTED'}</span>
-        </div>
-        <div className={`p-4 rounded-xl border ${activeTheme.border} bg-black/5 flex flex-col items-center`}>
-          <span className="text-[10px] uppercase font-bold opacity-60 mb-1">Live Pace</span>
-          <span className={`text-xl md:text-2xl font-black ${currentPace > plan.averagePaceSecondsPerKm ? 'text-red-500' : ''}`}>
-            {formatPace(currentPace || (elapsed / 1000 / (displayDistance || 1)))}
+        <div className={`p-5 rounded-2xl border ${activeTheme.border} bg-black/5 flex flex-col items-center`}>
+          <span className="text-[10px] uppercase font-black opacity-40 mb-1 tracking-widest">Live Pace</span>
+          <span className={`text-2xl md:text-3xl font-black ${currentPace > plan.averagePaceSecondsPerKm + 5 ? 'text-red-500' : ''}`}>
+            {formatPace(currentPace)}
           </span>
-          <span className="text-[10px] opacity-40 font-bold">MIN/KM</span>
+          <span className="text-[10px] font-bold opacity-40 mt-2 uppercase tracking-widest">MIN/KM</span>
         </div>
       </div>
 
       <div className="grid grid-cols-2 gap-3">
-        <div className={`p-3 rounded-xl border ${activeTheme.border} bg-blue-500/5 flex flex-col items-center`}>
-          <span className="text-[10px] uppercase font-bold opacity-60 mb-1">Next Water</span>
-          <span className="text-lg font-black text-blue-500">{nextHydrationKm.toFixed(0)} km</span>
+        <div className="p-4 rounded-xl bg-blue-500/5 border border-blue-500/10 flex flex-col items-center">
+          <span className="text-[10px] font-black uppercase text-blue-500/60 mb-1">Water</span>
+          <span className="text-lg font-black text-blue-600">{nextHydrationKm} km</span>
         </div>
-        <div className={`p-3 rounded-xl border ${activeTheme.border} bg-orange-500/5 flex flex-col items-center`}>
-          <span className="text-[10px] uppercase font-bold opacity-60 mb-1">Next Fuel</span>
-          <span className="text-lg font-black text-orange-500">{nextGelKm.toFixed(0)} km</span>
+        <div className="p-4 rounded-xl bg-orange-500/5 border border-orange-500/10 flex flex-col items-center">
+          <span className="text-[10px] font-black uppercase text-orange-500/60 mb-1">Fuel</span>
+          <span className="text-lg font-black text-orange-600">{nextGelKm} km</span>
         </div>
       </div>
-      
-      <div className="w-full bg-black/10 h-3 rounded-full overflow-hidden">
-        <div 
-          className={`h-full transition-all duration-500 ${activeTheme.accent}`}
-          style={{ width: `${Math.min(100, (displayDistance / plan.distanceKm) * 100)}%` }}
-        ></div>
-      </div>
-      <div className="flex justify-between text-[10px] font-black opacity-50 uppercase tracking-tighter">
-        <span>START</span>
-        <span>Goal: {plan.distanceKm.toFixed(1)} km</span>
-        <span>FINISH</span>
+
+      <div className="relative pt-2">
+        <div className="w-full bg-black/10 h-3 rounded-full overflow-hidden">
+          <div 
+            className={`h-full transition-all duration-1000 ${activeTheme.accent}`}
+            style={{ width: `${Math.min(100, (distanceKm / plan.distanceKm) * 100)}%` }}
+          ></div>
+        </div>
+        <div className="flex justify-between mt-2 text-[10px] font-black opacity-40 uppercase tracking-tighter">
+          <span>Start</span>
+          <span>Goal: {plan.distanceKm.toFixed(1)} km</span>
+        </div>
       </div>
     </div>
   );

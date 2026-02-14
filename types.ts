@@ -4,6 +4,7 @@ export type RacePhase = 'idle' | 'running' | 'finished';
 export type RaceType = '5k' | '10k' | 'half' | 'full' | 'custom';
 
 export interface PacePlan {
+  raceName: string;
   type: RaceType;
   distanceKm: number;
   targetTimeSeconds: number;
@@ -22,6 +23,7 @@ export interface SplitRow {
 export interface PaceSample {
   distance: number;
   pace: number; // seconds per km
+  elapsedMs: number; // total time at this distance
   timestamp: number;
 }
 
