@@ -1,0 +1,7 @@
+{
+  "name": "Marathon Companion",
+  "description": "A comprehensive marathon pacing and hydration planner with AI-powered strategy advice and customizable aesthetic themes.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
